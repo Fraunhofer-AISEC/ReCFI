@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// This file has been extended for implementation of "Resilient CFI" 
+// by Stefan Sessinghaus and Oliver Braunsdorf, Fraunhofer AISEC
+//
 //===----------------------------------------------------------------------===//
 //
 /// \file
@@ -52,6 +55,7 @@
 #include "llvm/ADT/None.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Triple.h"
@@ -102,6 +106,9 @@
 #include <vector>
 
 using namespace llvm;
+
+#define DEBUG_TYPE "dfsan_rcfi"
+STATISTIC(NumRCFIRetChecks, "Number of return instructions instrumented by RCFI");
 
 // External symbol to be used when generating the shadow address for
 // architectures with multiple VMAs. Instead of using a constant integer
@@ -158,6 +165,41 @@ static cl::opt<bool> ClDebugNonzeroLabels(
     "dfsan-debug-nonzero-labels",
     cl::desc("Insert calls to __dfsan_nonzero_label on observing a parameter, "
              "load or return with a nonzero label"),
+    cl::Hidden);
+
+// RCFI: new flag to activate checking the taint of the return address
+static cl::opt<bool> ClCheckBackwardEdge(
+    "dfsan-rcfi-backward",
+    cl::desc("Detect control flow hijacking attacks by checking the shadow "
+              "value of the return address before return."),
+    cl::Hidden);
+
+// RCFI: new flag to debug last stack frame in error handler
+static cl::opt<bool> ClDebugStackFrame(
+    "dfsan-rcfi-debug-stackframe",
+    cl::desc("When detecting control flow hijacking attack, " 
+    "send function name, RSP, and RBP to error handler"),
+    cl::Hidden, cl::init(false));
+
+// RCFI: new flag to debug last stack frame in error handler
+static cl::opt<bool> ClUserdataString(
+    "dfsan-rcfi-userdata-string",
+    cl::desc("When detecting control flow hijacking attack, " 
+    "pass some label userdata (IP address?) as string"),
+    cl::Hidden, cl::init(false));
+
+// RCFI: new flag to activate checking taint of indirect function calls
+static cl::opt<bool> ClCheckIndirectCalls(
+    "dfsan-rcfi-indirect-calls",
+    cl::desc("Detect control flow hijacking attacks by checking the shadow "
+              "value of target addresses of indirect function calls before "
+              "they are called"),
+    cl::Hidden);
+
+// RCFI: new flag to disable creation of new allocas for taints to be used in AllocaShadowMap
+static cl::opt<bool> ClNoTaintAllocas(
+    "dfsan-rcfi-no-taint-allocas",
+    cl::desc("Disable creating allocas for shadow values."),
     cl::Hidden);
 
 static StringRef GetGlobalTypeString(const GlobalValue &G) {
@@ -350,11 +392,22 @@ class DataFlowSanitizer : public ModulePass {
   FunctionCallee DFSanSetLabelFn;
   FunctionCallee DFSanNonzeroLabelFn;
   FunctionCallee DFSanVarargWrapperFn;
+
   MDNode *ColdCallWeights;
   DFSanABIList ABIList;
   DenseMap<Value *, Function *> UnwrappedFnMap;
   AttrBuilder ReadOnlyNoneAttrs;
   bool DFSanRuntimeShadowMask = false;
+
+  // RCFI declarations
+  FunctionType *RCFI_ErrorHandlerTy;
+  FunctionCallee RCFI_ErrorHandlerFn;
+  Function *AddrOfRetAddrFn;
+  Function *ReadRegIntrinsicFn;
+  IntegerType *ReturnShadowTy;
+  unsigned long ReturnInstructionChecks = 0;
+  unsigned long IndirectJumpInstructionChecks = 0;
+  unsigned long IndirectCallInstructionChecks = 0;
 
   Value *getShadowAddress(Value *Addr, Instruction *Pos);
   bool isInstrumented(const Function *F);
@@ -445,6 +498,7 @@ public:
   void visitStoreInst(StoreInst &SI);
   void visitReturnInst(ReturnInst &RI);
   void visitCallSite(CallSite CS);
+  void visitIndirectBrInst(IndirectBrInst &IBI);  // RCFI: securing indirect jumps
   void visitPHINode(PHINode &PN);
   void visitExtractElementInst(ExtractElementInst &I);
   void visitInsertElementInst(InsertElementInst &I);
@@ -563,6 +617,12 @@ bool DataFlowSanitizer::doInitialization(Module &M) {
   else
     report_fatal_error("unsupported triple");
 
+  // RCFI
+  // 64 bit wide return address (on 64 bit systems) x 16 bit Shadow Memory = 128 bit.
+  // Maybe calculate this using ShadowWidth and LLVM's DataLayout
+  // instead of hardcoding 128 bit.
+  ReturnShadowTy = IntegerType::get(*Ctx, 128);
+
   Type *DFSanUnionArgs[2] = { ShadowTy, ShadowTy };
   DFSanUnionFnTy =
       FunctionType::get(ShadowTy, DFSanUnionArgs, /*isVarArg=*/ false);
@@ -578,6 +638,24 @@ bool DataFlowSanitizer::doInitialization(Module &M) {
       Type::getVoidTy(*Ctx), None, /*isVarArg=*/false);
   DFSanVarargWrapperFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), Type::getInt8PtrTy(*Ctx), /*isVarArg=*/false);
+
+  // RCFI: Function Type for error handler
+  if (ClDebugStackFrame) {
+    Type *ErrorHandlerArgs[4] = {
+        ShadowTy,                 // taint label
+        Type::getInt8PtrTy(*Ctx), // function name (string)
+        Type::getInt64Ty(*Ctx),   // rsp
+        Type::getInt64Ty(*Ctx)    // rbp
+    };
+    RCFI_ErrorHandlerTy = FunctionType::get(
+        Type::getVoidTy(*Ctx), ErrorHandlerArgs, /*isVarArg=*/false);
+  } else {
+    Type *ErrorHandlerArgs[1] = {
+        ShadowTy, // taint label
+    };
+    RCFI_ErrorHandlerTy = FunctionType::get(
+        Type::getVoidTy(*Ctx), ErrorHandlerArgs, /*isVarArg=*/false);
+  }
 
   if (GetArgTLSPtr) {
     Type *ArgTLSTy = ArrayType::get(ShadowTy, 64);
@@ -709,9 +787,39 @@ Constant *DataFlowSanitizer::getOrBuildTrampolineFunction(FunctionType *FT,
 }
 
 bool DataFlowSanitizer::runOnModule(Module &M) {
+  if ((ClCheckBackwardEdge || ClCheckIndirectCalls) && ClArgsABI) {
+    errs() << "ERROR: the argument '-dfsan-args-abi' must not be used with RCFI, " \
+    "because it introduces a potential security loophole in RCFI\n";
+    exit(1);
+  }
   if (ABIList.isIn(M, "skip"))
     return false;
 
+  // RCFI: insert function for error handling (attack origin tracking) 
+  if (ClDebugStackFrame) {
+    RCFI_ErrorHandlerFn = 
+    Mod->getOrInsertFunction("__handle_tainted_address_debug",
+                            RCFI_ErrorHandlerTy);
+  } else if (ClUserdataString) {
+    RCFI_ErrorHandlerFn = 
+    Mod->getOrInsertFunction("__handle_tainted_address_string",
+                            RCFI_ErrorHandlerTy);
+  } else {
+    RCFI_ErrorHandlerFn = 
+    Mod->getOrInsertFunction("__handle_tainted_address",
+                            RCFI_ErrorHandlerTy);
+  }
+
+  // RCFI: insert function for getting the address of the return address
+  AddrOfRetAddrFn = Intrinsic::getDeclaration(Mod, Intrinsic::addressofreturnaddress);
+
+  if (ClDebugStackFrame) {
+    LLVMContext& C = M.getContext();
+    ReadRegIntrinsicFn = Intrinsic::getDeclaration(Mod, Intrinsic::read_register, Type::getInt64Ty(C));
+    assert(ReadRegIntrinsicFn != NULL);
+    LLVM_DEBUG(dbgs() << "\tdeclaration of read_register intrinsic: " << ReadRegIntrinsicFn->getName() <<"\n");
+  }
+  
   if (!GetArgTLSPtr) {
     Type *ArgTLSTy = ArrayType::get(ShadowTy, 64);
     ArgTLS = Mod->getOrInsertGlobal("__dfsan_arg_tls", ArgTLSTy);
@@ -788,7 +896,8 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
         &i != DFSanUnimplementedFn.getCallee()->stripPointerCasts() &&
         &i != DFSanSetLabelFn.getCallee()->stripPointerCasts() &&
         &i != DFSanNonzeroLabelFn.getCallee()->stripPointerCasts() &&
-        &i != DFSanVarargWrapperFn.getCallee()->stripPointerCasts())
+        &i != DFSanVarargWrapperFn.getCallee()->stripPointerCasts() &&
+        &i != RCFI_ErrorHandlerFn.getCallee()->stripPointerCasts())
       FnsToInstrument.push_back(&i);
   }
 
@@ -949,6 +1058,27 @@ bool DataFlowSanitizer::runOnModule(Module &M) {
           break;
         Inst = Next;
       }
+    }
+
+    // RCFI:
+    // the shadow of return address does not get set to zero, because the
+    // store instruction is inserted by the backend.
+    // This leads to false detection of a tainted return address. Fix it by reset 
+    // the taint of return addresses at the entry of every function
+    if (ClCheckBackwardEdge){
+        // set IR Builder to functions entry
+        Instruction *Entry = &i->getEntryBlock().front();
+        IRBuilder<> IRB(Entry);
+
+        // calculate the address of return address and corresponding shadow
+        Value *AddrOfRetAddr = IRB.CreateCall(DFSF.DFS.AddrOfRetAddrFn);
+        Value *ShadowAddr = DFSF.DFS.getShadowAddress(AddrOfRetAddr, Entry);
+
+        // set taint value of return address to zero
+        ConstantInt *ReturnShadow = ConstantInt::getSigned(DFSF.DFS.ReturnShadowTy, 0);
+        IRB.CreateStore(ReturnShadow,
+          IRB.CreateBitCast(ShadowAddr, PointerType::getUnqual(DFSF.DFS.ReturnShadowTy))
+        );
     }
 
     // We will not necessarily be able to compute the shadow for every phi node
@@ -1444,7 +1574,7 @@ void DFSanVisitor::visitAllocaInst(AllocaInst &I) {
     AllLoadsStores = false;
     break;
   }
-  if (AllLoadsStores) {
+  if (AllLoadsStores && !ClNoTaintAllocas) {
     IRBuilder<> IRB(&I);
     DFSF.AllocaShadowMap[&I] = IRB.CreateAlloca(DFSF.DFS.ShadowTy);
   }
@@ -1505,6 +1635,58 @@ void DFSanVisitor::visitMemTransferInst(MemTransferInst &I) {
 }
 
 void DFSanVisitor::visitReturnInst(ReturnInst &RI) {
+    if (ClCheckBackwardEdge) {
+    //RCFI: check the shadow value of the return address; call error handler if shadow is non zero
+      LLVM_DEBUG(dbgs() << "RCFI instrumenting return instruction");
+      DFSF.DFS.ReturnInstructionChecks += 1;
+      ++NumRCFIRetChecks;
+      
+      IRBuilder<> IRB(&RI);
+
+      // calculate and load shadow of return address
+      Value *AddrOfRetAddr = IRB.CreateCall(DFSF.DFS.AddrOfRetAddrFn);
+      Value *ShadowAddr = DFSF.DFS.getShadowAddress(AddrOfRetAddr, &RI);
+
+      // 8 byte load for return address (64-bit)
+      Value *ShadowValue = IRB.CreateCall(DFSF.DFS.DFSanUnionLoadFn,
+        {ShadowAddr, ConstantInt::get(DFSF.DFS.IntptrTy, 8)});
+
+
+      // compare shadow value with zero-taint
+      Value *Cmp = IRB.CreateICmpNE(ShadowValue, DFSF.DFS.ZeroShadow);
+      BranchInst *CheckTerm = cast<BranchInst>(SplitBlockAndInsertIfThen(Cmp, &RI, false));
+
+      // error case:
+      IRBuilder<> ThenIRB(CheckTerm);
+      llvm::SmallVector<Value*, 4> ErrorHandlerArgs = {ShadowValue};
+
+      if (ClDebugStackFrame) {
+        Function *func = RI.getFunction();
+        StringRef FunctionName;
+        if (func) {
+          FunctionName = func->getName();
+        } else {
+          FunctionName = StringRef("unknown function name");
+        }
+        Value *FunctionNamePtr = ThenIRB.CreateGlobalStringPtr(FunctionName);
+
+        LLVMContext &C = RI.getContext();
+        MDNode *MetaDataRSP = MDNode::get(C, {MDString::get(C, "rsp")});
+        MDNode *MetaDataRBP = MDNode::get(C, {MDString::get(C, "rbp")});
+        Value *ReadRegArgs_RSP[] = {MetadataAsValue::get(C, MetaDataRSP)};
+        Value *ReadRegArgs_RBP[] = {MetadataAsValue::get(C, MetaDataRBP)};
+        CallInst *RSP =
+            ThenIRB.CreateCall(DFSF.DFS.ReadRegIntrinsicFn, ReadRegArgs_RSP);
+        CallInst *RBP =
+            ThenIRB.CreateCall(DFSF.DFS.ReadRegIntrinsicFn, ReadRegArgs_RBP);
+
+        ErrorHandlerArgs.push_back(FunctionNamePtr);
+        ErrorHandlerArgs.push_back(RSP);
+        ErrorHandlerArgs.push_back(RBP);
+      }
+      ThenIRB.CreateCall(DFSF.DFS.RCFI_ErrorHandlerFn, ErrorHandlerArgs);
+  }
+  
   if (!DFSF.IsNativeABI && RI.getReturnValue()) {
     switch (DFSF.IA) {
     case DataFlowSanitizer::IA_TLS: {
@@ -1754,6 +1936,98 @@ void DFSanVisitor::visitCallSite(CallSite CS) {
     }
 
     CS.getInstruction()->eraseFromParent();
+  }
+
+  // RCFI check taint of function pointers for indirect calls
+  if ( F == NULL // indirect function call
+    && ClCheckIndirectCalls ) {
+    LLVM_DEBUG(dbgs() << "VisitCallSite\n");
+    Value *FnPtr = CS.getCalledValue();
+    Value *ShadowValue = DFSF.getShadow(FnPtr);
+    Value *Cond = IRB.CreateICmpNE(ShadowValue, DFSF.DFS.ZeroShadow);
+
+    BranchInst *CheckTerm = cast<BranchInst>
+      (SplitBlockAndInsertIfThen(/* *Cond */ Cond,
+                                  /* *SplitBefore */ CS.getInstruction(),
+                                  /* Unreachable */ false,
+                                  /* *BranchWeights */ DFSF.DFS.ColdCallWeights,
+                                  /* DominatorTree */ &DFSF.DT,
+                                  /* LoopInfo */ nullptr,
+                                  /* ThenBlock */ nullptr));
+    IRBuilder<> ThenIRB(CheckTerm);
+    llvm::SmallVector<Value*, 4> ErrorHandlerArgs = {ShadowValue};
+    if (ClDebugStackFrame) {
+        Function *func = CS.getInstruction()->getFunction();
+        StringRef FunctionName;
+        if (func) {
+          FunctionName = func->getName();
+        } else {
+          FunctionName = StringRef("unknown function name");
+        }
+        Value *FunctionNamePtr = ThenIRB.CreateGlobalStringPtr(FunctionName);
+
+        LLVMContext &C = CS.getInstruction()->getContext();
+        MDNode *MetaDataRSP = MDNode::get(C, {MDString::get(C, "rsp")});
+        MDNode *MetaDataRBP = MDNode::get(C, {MDString::get(C, "rbp")});
+        Value *ReadRegArgs_RSP[] = {MetadataAsValue::get(C, MetaDataRSP)};
+        Value *ReadRegArgs_RBP[] = {MetadataAsValue::get(C, MetaDataRBP)};
+        CallInst *RSP =
+            ThenIRB.CreateCall(DFSF.DFS.ReadRegIntrinsicFn, ReadRegArgs_RSP);
+        CallInst *RBP =
+            ThenIRB.CreateCall(DFSF.DFS.ReadRegIntrinsicFn, ReadRegArgs_RBP);
+
+        ErrorHandlerArgs.push_back(FunctionNamePtr);
+        ErrorHandlerArgs.push_back(RSP);
+        ErrorHandlerArgs.push_back(RBP);
+      }
+    ThenIRB.CreateCall(DFSF.DFS.RCFI_ErrorHandlerFn, ErrorHandlerArgs);
+  }
+}
+
+void DFSanVisitor::visitIndirectBrInst(IndirectBrInst &IBI) {
+  // RCFI check taint of target addresses for indirect jumps
+  if (ClCheckIndirectCalls ) {
+    LLVM_DEBUG(dbgs() << "Visit Indirect Branch Instruction\n");
+    Value* JumpTarget = IBI.getAddress();
+    Value *ShadowValue = DFSF.getShadow(JumpTarget);
+     IRBuilder<> IRB(&IBI);
+    Value *Cond = IRB.CreateICmpNE(ShadowValue, DFSF.DFS.ZeroShadow);
+
+    BranchInst *CheckTerm = cast<BranchInst>
+      (SplitBlockAndInsertIfThen(/* *Cond */ Cond,
+                                  /* *SplitBefore */ &IBI,
+                                  /* Unreachable */ false,
+                                  /* *BranchWeights */ DFSF.DFS.ColdCallWeights,
+                                  /* DominatorTree */ &DFSF.DT,
+                                  /* LoopInfo */ nullptr,
+                                  /* ThenBlock */ nullptr));
+    IRBuilder<> ThenIRB(CheckTerm);
+    llvm::SmallVector<Value*, 4> ErrorHandlerArgs = {ShadowValue};
+    if (ClDebugStackFrame) {
+        Function *func = IBI.getFunction();
+        StringRef FunctionName;
+        if (func) {
+          FunctionName = func->getName();
+        } else {
+          FunctionName = StringRef("unknown function name");
+        }
+        Value *FunctionNamePtr = ThenIRB.CreateGlobalStringPtr(FunctionName);
+
+        LLVMContext &C = IBI.getContext();
+        MDNode *MetaDataRSP = MDNode::get(C, {MDString::get(C, "rsp")});
+        MDNode *MetaDataRBP = MDNode::get(C, {MDString::get(C, "rbp")});
+        Value *ReadRegArgs_RSP[] = {MetadataAsValue::get(C, MetaDataRSP)};
+        Value *ReadRegArgs_RBP[] = {MetadataAsValue::get(C, MetaDataRBP)};
+        CallInst *RSP =
+            ThenIRB.CreateCall(DFSF.DFS.ReadRegIntrinsicFn, ReadRegArgs_RSP);
+        CallInst *RBP =
+            ThenIRB.CreateCall(DFSF.DFS.ReadRegIntrinsicFn, ReadRegArgs_RBP);
+
+        ErrorHandlerArgs.push_back(FunctionNamePtr);
+        ErrorHandlerArgs.push_back(RSP);
+        ErrorHandlerArgs.push_back(RBP);
+      }
+    ThenIRB.CreateCall(DFSF.DFS.RCFI_ErrorHandlerFn, ErrorHandlerArgs);
   }
 }
 

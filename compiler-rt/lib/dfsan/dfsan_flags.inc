@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// This file has been extended for implementation of "Resilient CFI" 
+// by Stefan Sessinghaus and Oliver Braunsdorf, Fraunhofer AISEC
+//
 //===----------------------------------------------------------------------===//
 //
 // DFSan runtime flags.
@@ -16,6 +19,8 @@
 // DFSAN_FLAG(Type, Name, DefaultValue, Description)
 // See COMMON_FLAG in sanitizer_flags.inc for more details.
 
+DFSAN_FLAG(bool, wrap_labels, true,
+           "RCFI: Whether wrap around when going out of labels.")
 DFSAN_FLAG(bool, warn_unimplemented, true,
            "Whether to warn on unimplemented functions.")
 DFSAN_FLAG(bool, warn_nonzero_labels, false,

@@ -4,6 +4,8 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
+// This file has been extended for implementation of "Resilient CFI" 
+// by Stefan Sessinghaus and Oliver Braunsdorf, Fraunhofer AISEC
 //===----------------------------------------------------------------------===//
 //
 // This file is a part of DataFlowSanitizer.
@@ -26,6 +28,11 @@
 #include "sanitizer_common/sanitizer_libc.h"
 
 #include "dfsan/dfsan.h"
+#include <cstdio>
+#include <unistd.h>
+#include <stdint.h> // uintX_t defintions 
+
+#define RCFI_ERROR_CODE 177
 
 using namespace __dfsan;
 
@@ -151,11 +158,18 @@ static atomic_dfsan_label *union_table(dfsan_label l1, dfsan_label l2) {
 }
 
 // Checks we do not run out of labels.
-static void dfsan_check_label(dfsan_label label) {
+dfsan_label dfsan_check_label(dfsan_label label) {
   if (label == kInitializingLabel) {
-    Report("FATAL: DataFlowSanitizer: out of labels\n");
-    Die();
+    if (flags().wrap_labels) {
+      // RCFI Wrap around instead of dying
+      Report("FATAL: DataFlowSanitizer: out of labels, wrapping around\n");
+      label = atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
+    } else {
+      Report("FATAL: DataFlowSanitizer: out of labels\n");
+      Die();
+    }    
   }
+  return label;
 }
 
 // Resolves the union of two unequal labels.  Nonequality is a precondition for
@@ -190,7 +204,7 @@ dfsan_label __dfsan_union(dfsan_label l1, dfsan_label l2) {
     } else {
       label =
         atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
-      dfsan_check_label(label);
+      label = dfsan_check_label(label);
       __dfsan_label_info[label].l1 = l1;
       __dfsan_label_info[label].l2 = l2;
     }
@@ -253,7 +267,7 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label dfsan_create_label(const char *desc, void *userdata) {
   dfsan_label label =
     atomic_fetch_add(&__dfsan_last_label, 1, memory_order_relaxed) + 1;
-  dfsan_check_label(label);
+  label = dfsan_check_label(label);
   __dfsan_label_info[label].l1 = __dfsan_label_info[label].l2 = 0;
   __dfsan_label_info[label].desc = desc;
   __dfsan_label_info[label].userdata = userdata;
@@ -444,6 +458,40 @@ static void dfsan_init(int argc, char **argv, char **envp) {
   AddDieCallback(dfsan_fini);
 
   __dfsan_label_info[kInitializingLabel].desc = "<init label>";
+}
+
+//RCFI
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __handle_tainted_address_debug(dfsan_label taint, char * function, uint64_t rsp, uint64_t rbp){
+  fprintf(stderr, "\tRCFI detected overwritten address [taint = %d] in function %s\n", taint, function);
+  void *stack_bottom = (void*) rbp;
+  void *stack_top = (void*) rsp;
+
+  fprintf(stderr, "rbp = %p, rsp = %p)\n", stack_bottom, stack_top);
+  for (uint8_t* i = (uint8_t*) stack_bottom; i >= stack_top; i--) {
+    dfsan_label i_taint = dfsan_read_label(i, 1); // 1 byte. read stack byte for byte
+    fprintf(stderr, "byte at addr %p: value = 0x%x [label = %d]\n", i, *i, i_taint);
+  }
+  //fprintf(stderr, "\tkill process %d\n", getpid());
+  _exit(RCFI_ERROR_CODE);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __handle_tainted_address_string(dfsan_label taint){
+  fprintf(stderr, "\tRCFI detected overwritten address [taint = %d]\n", taint);
+  void* userdata = __dfsan_label_info[taint].userdata;
+  const char* userstring = "unknown user string";
+  if (userdata != NULL) {
+    userstring = (char*) userdata; 
+  };
+  fprintf(stderr, "\t[userstring='%s']\n", userstring);
+  _exit(RCFI_ERROR_CODE);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __handle_tainted_address(dfsan_label taint){
+  fprintf(stderr, "\tRCFI detected overwritten address [taint = %d]\n", taint);
+  _exit(RCFI_ERROR_CODE);
 }
 
 #if SANITIZER_CAN_USE_PREINIT_ARRAY

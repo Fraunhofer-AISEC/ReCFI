@@ -1,0 +1,32 @@
+version: '3'
+
+
+services:
+  llvm-builder:
+    build: 
+      context: .
+      dockerfile: llvm-builder.Dockerfile
+    env_file:
+      - .env
+      - custom.env
+    volumes:
+      - ../llvm:/home/builder/llvm-project/llvm
+      - ../clang:/home/builder/llvm-project/clang
+      - ../compiler-rt:/home/builder/llvm-project/compiler-rt
+      - ../lld:/home/builder/llvm-project/lld
+      - ~/.ccache:/home/builder/.ccache
+
+  rcfi-tester:
+    build: 
+      context: .
+      dockerfile: rcfi-tester.Dockerfile
+    cap_add:
+      - SYS_PTRACE 
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ../rcfi-test:/home/builder/llvm-project/rcfi-test
+      - ../llvm:/home/builder/llvm-project/llvm
+      - ../clang:/home/builder/llvm-project/clang
+      - ../compiler-rt:/home/builder/llvm-project/compiler-rt
+      - ../lld:/home/builder/llvm-project/lld

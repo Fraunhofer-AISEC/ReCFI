@@ -28,6 +28,12 @@ fun:dfsan_set_write_callback=uninstrumented
 fun:dfsan_set_write_callback=custom
 
 ###############################################################################
+# RCFI functions
+###############################################################################
+fun:__rcfi_handle_tainted_return_address=uninstrumented
+fun:__rcfi_handle_tainted_return_address=discard
+
+###############################################################################
 # glibc
 ###############################################################################
 fun:malloc=discard
